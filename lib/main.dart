@@ -1,20 +1,10 @@
+// lib/main.dart
 import 'package:flutter/material.dart';
+import 'app.dart'; // MyApp 위젯 임포트
 
 void main() {
-  runApp(const MainApp());
-}
-
-class MainApp extends StatelessWidget {
-  const MainApp({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return const MaterialApp(
-      home: Scaffold(
-        body: Center(
-          child: Text('Hello World!'),
-        ),
-      ),
-    );
-  }
+  // Flutter 엔진 바인딩 초기화
+  WidgetsFlutterBinding.ensureInitialized();
+  // 앱 실행 (MyApp 위젯 사용)
+  runApp(const MyApp());
 }
