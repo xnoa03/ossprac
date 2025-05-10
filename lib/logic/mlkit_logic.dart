@@ -1,133 +1,164 @@
 // lib/logic/mlkit_logic.dart
+import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
-import 'package:flutter/services.dart'; // RootIsolateToken, BackgroundIsolateBinaryMessenger
+import 'dart:ui'; // Size 사용
+import 'dart:io' show Platform; // Platform 사용을 위해 dart:io 임포트
+
+// import 'package:camera/camera.dart'; // CameraLensDirection, CameraDescription 등 사용 시 필요 (현재 파일에서는 직접 사용 안함)
+import 'package:flutter/services.dart'; // DeviceOrientation, RootIsolateToken, BackgroundIsolateBinaryMessenger
 import 'package:google_mlkit_commons/google_mlkit_commons.dart';
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
-import 'dart:io'; // Platform
+// camera_screen.dart 에서 정의한 IsolateDataHolder를 사용하려면 import 하거나 여기에 정의
+// IsolateDataHolder는 camera_screen.dart에 있으므로, 해당 파일에서 이 파일을 import할 때 순환 참조가 발생하지 않도록 주의
+// 여기서는 IsolateDataHolder가 camera_screen.dart에 있다고 가정하고, mlkit_logic.dart는 camera_screen.dart에 의해 import됨
+import '../camera_screen.dart';
 
-// ML Kit ObjectDetector 초기화 함수 (옵션 설정 포함)
+
+// ObjectDetector 초기화 (camera_screen.dart의 initState에서 호출)
 ObjectDetector initializeObjectDetector() {
-  print("Initializing ML Kit detector...");
+  print("Logic: Initializing ObjectDetector...");
   final options = ObjectDetectorOptions(
-    mode: DetectionMode.stream,
-    classifyObjects: true, // <<-- [네임태그] 분류 활성화
-    multipleObjects: true, // <<-- [바운딩 박스] 다중 객체 활성화
+    mode: DetectionMode.stream, // 스트림(단일 이미지) 모드
+    classifyObjects: true,      // 객체 분류 활성화
+    multipleObjects: true,      // 다중 객체 감지 활성화
   );
   return ObjectDetector(options: options);
 }
 
-// --- Isolate 실행 함수들 ---
+// 이미지 회전 계산 Isolate 진입점
+void getImageRotationIsolateEntry(SendPort mainSendPort) {
+  final ReceivePort isolateReceivePort = ReceivePort();
+  mainSendPort.send(isolateReceivePort.sendPort); // 메인 Isolate로 Isolate의 SendPort 전송
 
-// 객체 탐지 Isolate 진입점
-@pragma('vm:entry-point')
-void detectObjectsIsolateEntry(List<Object> args) {
-  final SendPort mainSendPort = args[0] as SendPort;
-  final RootIsolateToken rootIsolateToken = args[1] as RootIsolateToken;
+  isolateReceivePort.listen((dynamic message) {
+    try {
+      // print("RotationIsolate received: $message");
+      if (message is Map<String, dynamic>) {
+        final int sensorOrientation = message['sensorOrientation'];
+        final int deviceOrientationIndex = message['deviceOrientationIndex'];
+        final DeviceOrientation deviceOrientation = DeviceOrientation.values[deviceOrientationIndex];
+        // final CameraLensDirection lensDirection = CameraLensDirection.values[message['lensDirection']]; // 필요하다면
 
-  // 플랫폼 채널 초기화 (ML Kit 내부 사용)
-  BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
-
-  final ReceivePort receivePort = ReceivePort();
-  mainSendPort.send(receivePort.sendPort); // 메인 스레드에 응답 포트 전송
-
-  receivePort.listen((message) async { // 데이터 수신 대기
-    if (message is List) {
-      try {
-        final Uint8List bytes = message[0];
-        final int width = message[1];
-        final int height = message[2];
-        final InputImageRotation rotation = message[3];
-        final int formatRaw = message[4];
-        final int bytesPerRow = message[5];
-
-        // 실제 탐지 로직 호출
-        final List<DetectedObject> objects = await _detectObjectsImpl(
-            bytes, width, height, rotation, formatRaw, bytesPerRow);
-        mainSendPort.send(objects); // 결과 전송
-      } catch (e, stacktrace) {
-        print("****** Error in detectObjectsIsolateEntry listen: $e");
-        print(stacktrace);
-        mainSendPort.send(['Error from Detection Isolate', e.toString()]); // 오류 전송
+        final InputImageRotation rotation = _calculateRotation(sensorOrientation, deviceOrientation /*, lensDirection*/);
+        mainSendPort.send(rotation);
+      } else {
+        throw Exception("Invalid message type for rotation isolate: ${message.runtimeType}");
       }
+    } catch (e, stacktrace) {
+      print('****** Rotation Isolate Error: $e\n$stacktrace');
+      mainSendPort.send(['Error from RotationIsolate', e.toString()]); // 오류 정보 전송
     }
   });
 }
 
-// 실제 객체 탐지 구현 (Isolate 내부)
-Future<List<DetectedObject>> _detectObjectsImpl(
-    Uint8List bytes, int width, int height, InputImageRotation rotation,
-    int formatRaw, int bytesPerRow) async {
-  // Isolate 내에서 탐지기 생성 및 사용
-  final options = ObjectDetectorOptions(
-    mode: DetectionMode.single,
-    classifyObjects: true, // <<-- [네임태그] 분류 활성화
-    multipleObjects: true, // <<-- [바운딩 박스] 다중 객체 활성화
-  );
-  final ObjectDetector objectDetector = ObjectDetector(options: options);
+InputImageRotation _calculateRotation(int sensorOrientation, DeviceOrientation deviceOrientation /*, CameraLensDirection lensDirection */) {
+  // print("_calculateRotation: sensor=$sensorOrientation, device=$deviceOrientation");
+  if (Platform.isIOS) { // dart:io의 Platform 사용
+    // iOS는 sensorOrientation이 보통 ML Kit의 InputImageRotation과 직접 매핑됨.
+    switch (sensorOrientation) {
+      case 0: return InputImageRotation.rotation0deg;
+      case 90: return InputImageRotation.rotation90deg;
+      case 180: return InputImageRotation.rotation180deg;
+      case 270: return InputImageRotation.rotation270deg;
+      default: return InputImageRotation.rotation0deg;
+    }
+  }
 
-  final inputImage = InputImage.fromBytes(
-    bytes: bytes,
-    metadata: InputImageMetadata(
-      size: Size(width.toDouble(), height.toDouble()),
-      rotation: rotation,
-      format: InputImageFormatValue.fromRawValue(formatRaw) ?? InputImageFormat.nv21,
-      bytesPerRow: bytesPerRow,
-    ),
-  );
+  // Android 계산 로직
+  int rotationCompensation = 0;
+  switch (deviceOrientation) {
+    case DeviceOrientation.portraitUp:
+      rotationCompensation = 0;
+      break;
+    case DeviceOrientation.landscapeRight: // 홈버튼이 왼쪽 (시계 방향 90도 회전)
+      rotationCompensation = 90;
+      break;
+    case DeviceOrientation.portraitDown:
+      rotationCompensation = 180;
+      break;
+    case DeviceOrientation.landscapeLeft: // 홈버튼이 오른쪽 (반시계 방향 90도 회전 또는 시계방향 270도)
+      rotationCompensation = 270;
+      break;
+  }
 
-  try {
-    final List<DetectedObject> objects = await objectDetector.processImage(inputImage);
-    return objects; // <<-- [바운딩 박스][네임태그] 결과 반환
-  } catch (e, stacktrace) {
-    print("****** Error processing image in _detectObjectsImpl: $e");
-    print(stacktrace);
-    return <DetectedObject>[];
-  } finally {
-    await objectDetector.close(); // 리소스 해제
+  int resultRotationDegrees = (sensorOrientation - rotationCompensation + 360) % 360;
+
+  switch (resultRotationDegrees) {
+    case 0:
+      return InputImageRotation.rotation0deg;
+    case 90:
+      return InputImageRotation.rotation90deg;
+    case 180:
+      return InputImageRotation.rotation180deg;
+    case 270:
+      return InputImageRotation.rotation270deg;
+    default:
+      print('****** Unknown rotation degrees: $resultRotationDegrees. Defaulting to 0deg.');
+      return InputImageRotation.rotation0deg;
   }
 }
 
-// 이미지 회전 계산 Isolate 진입점
-@pragma('vm:entry-point')
-void getImageRotationIsolateEntry(SendPort sendPort) {
-  final ReceivePort receivePort = ReceivePort();
-  sendPort.send(receivePort.sendPort);
 
-  receivePort.listen((message) { // 방향 정보 수신 대기
-     if (message is List && message.length == 2) {
-        try {
-          final int sensorOrientation = message[0];
-          final DeviceOrientation deviceOrientation = message[1];
-          // 실제 회전 계산 로직 호출
-          final InputImageRotation? rotation = _getImageRotationImpl(
-              sensorOrientation, deviceOrientation);
-          sendPort.send(rotation); // 계산 결과 전송
-        } catch (e, stacktrace) {
-          print("****** Error in getImageRotationIsolateEntry listen: $e");
-          print(stacktrace);
-          sendPort.send(['Error from Rotation Isolate', e.toString()]); // 오류 전송
-        }
-     }
+// 객체 탐지 Isolate 진입점
+void detectObjectsIsolateEntry(IsolateDataHolder isolateDataHolder) {
+  final SendPort mainSendPort = isolateDataHolder.mainSendPort;
+  final RootIsolateToken? rootIsolateToken = isolateDataHolder.rootIsolateToken;
+
+  final ReceivePort isolateReceivePort = ReceivePort();
+  mainSendPort.send(isolateReceivePort.sendPort); // 메인 Isolate로 Isolate의 SendPort 전송
+
+  if (rootIsolateToken != null) {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    print("DetectionIsolate: BackgroundIsolateBinaryMessenger initialized.");
+  } else {
+    print("****** Detection Isolate: RootIsolateToken is null. ML Kit might fail.");
+  }
+
+  final ObjectDetector objectDetector = initializeObjectDetector();
+  print("DetectionIsolate: ObjectDetector initialized.");
+
+
+  isolateReceivePort.listen((dynamic message) async {
+    if (message is Map<String, dynamic>) {
+      // print("DetectionIsolate received data for processing.");
+      try {
+        final Uint8List bytes = message['bytes'];
+        final int width = message['width'];
+        final int height = message['height'];
+        final InputImageRotation rotation = message['rotation']; // 이미 InputImageRotation 타입
+        final int formatRaw = message['formatRaw'];
+        final int bytesPerRowData = message['bytesPerRow'];
+
+        final InputImageFormat imageFormat =
+            InputImageFormatValue.fromRawValue(formatRaw) ?? InputImageFormat.nv21;
+        // print("DetectionIsolate: formatRaw=$formatRaw, resolvedFormat=$imageFormat, rotation=$rotation, bytesPerRow=$bytesPerRowData");
+
+        // InputImageMetadata 객체 생성 (수정된 부분)
+        final InputImageMetadata metadata = InputImageMetadata(
+          size: Size(width.toDouble(), height.toDouble()),
+          rotation: rotation,
+          format: imageFormat,
+          bytesPerRow: bytesPerRowData, // 첫 번째(또는 유일한) 평면의 bytesPerRow
+        );
+
+        // InputImage.fromBytes 생성자 호출 (수정된 부분)
+        final InputImage inputImage = InputImage.fromBytes(
+          bytes: bytes,
+          metadata: metadata, // 이전 inputImageData 대신 metadata 사용
+        );
+
+        final List<DetectedObject> objects =
+            await objectDetector.processImage(inputImage);
+        // print("DetectionIsolate: Detected ${objects.length} objects.");
+        mainSendPort.send(objects);
+      } catch (e, stacktrace) {
+        print('****** Detection Isolate processImage Error: $e\n$stacktrace');
+        mainSendPort.send(['Error from DetectionIsolate', e.toString()]);
+      }
+    } else {
+       print('****** Detection Isolate received invalid message type: ${message.runtimeType}');
+       mainSendPort.send(['Error from DetectionIsolate', 'Invalid message type: ${message.runtimeType}']);
+    }
   });
-}
-
-// 실제 이미지 회전 계산 (Isolate 내부)
-InputImageRotation? _getImageRotationImpl(
-    int sensorOrientation, DeviceOrientation deviceOrientation) {
-  // 플랫폼별 계산 로직 (이전 코드와 동일)
-   if (Platform.isIOS) {
-     int deviceOrientationAngle = 0; switch (deviceOrientation) { case DeviceOrientation.portraitUp: deviceOrientationAngle = 0; break; case DeviceOrientation.landscapeLeft: deviceOrientationAngle = 90; break; case DeviceOrientation.portraitDown: deviceOrientationAngle = 180; break; case DeviceOrientation.landscapeRight: deviceOrientationAngle = 270; break; default: break; }
-     var compensatedRotation = (sensorOrientation + deviceOrientationAngle) % 360;
-     return _rotationIntToInputImageRotation(compensatedRotation);
-  } else { // Android
-     int deviceOrientationAngle = 0; switch (deviceOrientation) { case DeviceOrientation.portraitUp: deviceOrientationAngle = 0; break; case DeviceOrientation.landscapeLeft: deviceOrientationAngle = 90; break; case DeviceOrientation.portraitDown: deviceOrientationAngle = 180; break; case DeviceOrientation.landscapeRight: deviceOrientationAngle = 270; break; default: break; }
-     var compensatedRotation = (sensorOrientation - deviceOrientationAngle + 360) % 360;
-     return _rotationIntToInputImageRotation(compensatedRotation);
-  }
-}
-
-// 회전 각도를 InputImageRotation enum으로 변환
-InputImageRotation _rotationIntToInputImageRotation(int rotation) {
-   switch (rotation) { case 0: return InputImageRotation.rotation0deg; case 90: return InputImageRotation.rotation90deg; case 180: return InputImageRotation.rotation180deg; case 270: return InputImageRotation.rotation270deg; default: return InputImageRotation.rotation0deg;}
 }
