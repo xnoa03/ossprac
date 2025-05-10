@@ -15,7 +15,6 @@ import 'dart:io'; // Platform
 class IsolateDataHolder {
   final SendPort mainSendPort;
   final RootIsolateToken? rootIsolateToken; // ML Kit은 RootIsolateToken 필요
-  // final dynamic data; // Isolate에 전달할 초기 데이터 (현재 구조에서는 사용 안함)
 
   IsolateDataHolder(this.mainSendPort, this.rootIsolateToken);
 }
@@ -36,7 +35,7 @@ class _RealtimeObjectDetectionScreenState
   int _cameraIndex = 0;
   bool _isCameraInitialized = false;
   bool _isBusy = false; // 이미지 처리 중복 방지 플래그
-  List<DetectedObject> _detectedObjects = [];
+  List<DetectedObject> _detectedObjects = []; // 항상 이 리스트를 Painter에 전달 (내용이 0 또는 1개 객체)
   InputImageRotation? _imageRotation; // Painter에 전달될 최종 회전 값
   late ObjectDetector _objectDetector;
   Size? _lastImageSize; // ML Kit이 처리한 이미지의 크기
@@ -69,8 +68,6 @@ class _RealtimeObjectDetectionScreenState
     print("RealtimeObjectDetectionScreen: initState called");
     _objectDetector = initializeObjectDetector(); // ML Kit 로직 파일에서 초기화 함수 호출
 
-    // Completer를 사용한 대기 로직 없이 Isolate를 스폰하고,
-    // SendPort는 비동기적으로 설정되도록 합니다.
     _spawnIsolates().then((_) {
       if (widget.cameras.isNotEmpty) {
         _initializeCamera(widget.cameras[0]); // 카메라 초기화
@@ -113,18 +110,15 @@ class _RealtimeObjectDetectionScreenState
     super.dispose();
   }
 
-  // --- Isolate 생성 및 관리 ---
   Future<void> _spawnIsolates() async {
     print("Spawning Isolates...");
     final RootIsolateToken? rootIsolateToken = RootIsolateToken.instance;
 
     if (rootIsolateToken == null) {
       print("****** RootIsolateToken is null. ML Kit in Isolate might not work.");
-      // 이 경우 Isolate 스폰을 중단하거나, 사용자에게 알릴 수 있습니다.
-      return; // 스폰 중단
+      return; 
     }
 
-    // 탐지 Isolate
     _objectDetectionReceivePort = ReceivePort();
     _objectDetectionIsolate = await Isolate.spawn(
       detectObjectsIsolateEntry,
@@ -137,11 +131,10 @@ class _RealtimeObjectDetectionScreenState
         _objectDetectionReceivePort.listen(_handleDetectionResult);
     print("Object Detection Isolate spawned and listener attached.");
 
-    // 회전 Isolate
     _imageRotationReceivePort = ReceivePort();
     _imageRotationIsolate = await Isolate.spawn(
       getImageRotationIsolateEntry,
-      _imageRotationReceivePort.sendPort, // 회전 Isolate는 메인 SendPort만 필요
+      _imageRotationReceivePort.sendPort, 
       onError: _imageRotationReceivePort.sendPort,
       onExit: _imageRotationReceivePort.sendPort,
       debugName: "ImageRotationIsolate"
@@ -169,25 +162,36 @@ class _RealtimeObjectDetectionScreenState
     _imageRotationIsolate = null;
     _objectDetectionIsolateSendPort = null;
     _imageRotationIsolateSendPort = null;
-    // ReceivePort는明시적으로 close할 필요 없음, Isolate 종료 시 정리됨
   }
 
-  // --- Isolate 결과 처리 핸들러 ---
   void _handleDetectionResult(dynamic message) {
-    if (!mounted) return; // 위젯이 unmounted된 후에는 상태 변경 시도 방지
+    if (!mounted) return; 
 
     if (_objectDetectionIsolateSendPort == null && message is SendPort) {
       print("Object Detection Isolate SendPort received via message.");
       _objectDetectionIsolateSendPort = message;
     } else if (message is List<DetectedObject>) {
-      // print("Detected objects: ${message.length}");
+      List<DetectedObject> objectsToShow = []; 
+
+      if (message.isNotEmpty) {
+        DetectedObject closestObject = message.reduce((curr, next) {
+          final double areaCurr = curr.boundingBox.width * curr.boundingBox.height;
+          final double areaNext = next.boundingBox.width * next.boundingBox.height;
+          return areaCurr > areaNext ? curr : next;
+        });
+        objectsToShow.add(closestObject);
+      }
+
       _isWaitingForDetection = false;
-      setState(() {
-        _detectedObjects = message;
-        _imageRotation = _lastCalculatedRotation; // 회전 값 동기화
-      });
+      if (mounted) { 
+        setState(() {
+          _detectedObjects = objectsToShow; 
+          _imageRotation = _lastCalculatedRotation; 
+        });
+      }
+      
       if (!_isWaitingForRotation && !_isWaitingForDetection && _isBusy) {
-        _isBusy = false;
+        _isBusy = false; 
       }
     } else if (message is List &&
         message.length == 2 &&
@@ -197,16 +201,22 @@ class _RealtimeObjectDetectionScreenState
       _isWaitingForDetection = false;
       if (!_isWaitingForRotation && _isBusy) _isBusy = false;
     } else if (message == null || (message is List && message.isEmpty && message is! List<DetectedObject>)) {
-      // Isolate 종료 시 null 또는 빈 리스트를 보낼 수 있음 (onExit 핸들러)
       print('****** Object Detection Isolate exited or sent empty/null message.');
-      _isWaitingForDetection = false;
-      if (_objectDetectionIsolateSendPort != null && message == null) { // Isolate가 예기치 않게 종료된 경우
-          _objectDetectionIsolateSendPort = null; // SendPort 무효화
+       _isWaitingForDetection = false;
+      if (_objectDetectionIsolateSendPort != null && message == null) {
+          _objectDetectionIsolateSendPort = null; 
           print("Object Detection Isolate SendPort invalidated due to Isolate exit.");
+      }
+      if (_detectedObjects.isNotEmpty && mounted) { 
+        setState(() {
+          _detectedObjects = [];
+        });
       }
       if (!_isWaitingForRotation && _isBusy) _isBusy = false;
     } else {
       print('****** Unexpected message from Object Detection Isolate: $message, type: ${message.runtimeType}');
+      _isWaitingForDetection = false;
+      if (!_isWaitingForRotation && _isBusy) _isBusy = false;
     }
   }
 
@@ -217,32 +227,31 @@ class _RealtimeObjectDetectionScreenState
       print("Image Rotation Isolate SendPort received via message.");
       _imageRotationIsolateSendPort = message;
     } else if (message is InputImageRotation?) {
-      // print("Calculated rotation: $message");
       _isWaitingForRotation = false;
-      _lastCalculatedRotation = message; // Painter가 사용할 최종 회전값
-      _imageRotation = message; // setState에서 UI 업데이트 시 사용 (CustomPaint 조건부 렌더링)
-
+      _lastCalculatedRotation = message; 
+      _imageRotation = message; 
 
       if (_pendingImageDataBytes != null &&
           _objectDetectionIsolateSendPort != null &&
-          message != null) { // message(InputImageRotation)가 null이 아닐 때만 전송
+          message != null) { 
         _isWaitingForDetection = true;
-        _lastImageSize = Size(_pendingImageDataWidth!.toDouble(), _pendingImageDataHeight!.toDouble());
+        _lastImageSize = Size(_pendingImageDataWidth!.toDouble(),
+            _pendingImageDataHeight!.toDouble());
 
         final Map<String, dynamic> payload = {
           'bytes': _pendingImageDataBytes!,
           'width': _pendingImageDataWidth!,
           'height': _pendingImageDataHeight!,
-          'rotation': message, // InputImageRotation
+          'rotation': message, 
           'formatRaw': _pendingImageDataFormatRaw!,
           'bytesPerRow': _pendingImageDataBytesPerRow!,
         };
         _objectDetectionIsolateSendPort!.send(payload);
-        _pendingImageDataBytes = null; // 전송 후 초기화
+        _pendingImageDataBytes = null; 
       } else {
         if (message == null) print("Rotation calculation resulted in null, not sending to detection isolate.");
-        if (_pendingImageDataBytes == null) print("Pending image data is null.");
-        if (_objectDetectionIsolateSendPort == null) print("Object detection isolate send port is null.");
+        // if (_pendingImageDataBytes == null) print("Pending image data is null."); // This can be normal if no new image processed yet
+        // if (_objectDetectionIsolateSendPort == null) print("Object detection isolate send port is null.");
 
         if (!_isWaitingForDetection && _isBusy) _isBusy = false;
       }
@@ -266,44 +275,41 @@ class _RealtimeObjectDetectionScreenState
     }
      else {
       print('****** Unexpected message from Image Rotation Isolate: $message, type: ${message.runtimeType}');
+      _isWaitingForRotation = false;
+      _pendingImageDataBytes = null; 
+      if (!_isWaitingForDetection && _isBusy) _isBusy = false;
     }
   }
 
-  // --- 카메라 관련 로직 ---
   Future<void> _initializeCamera(CameraDescription cameraDescription) async {
     if (_cameraController != null && _cameraController!.value.isInitialized) {
       print("Disposing previous camera controller before initializing a new one.");
-      await _stopCameraStream(); // 스트림 중지
-      await _cameraController!.dispose(); // 이전 컨트롤러 확실히 해제
-      _cameraController = null; // null로 설정
+      await _stopCameraStream(); 
+      await _cameraController!.dispose(); 
+      _cameraController = null; 
     }
-     if (mounted) setState(() => _isCameraInitialized = false); // 초기화 중 상태로 UI 업데이트
+     if (mounted) setState(() => _isCameraInitialized = false); 
 
     print("Initializing camera: ${cameraDescription.name} with lens direction ${cameraDescription.lensDirection}");
     _cameraController = CameraController(
       cameraDescription,
-      ResolutionPreset.high, // 화질 향상을 위해 high 시도, 문제 시 medium으로 복귀
+      ResolutionPreset.high, 
       enableAudio: false,
       imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21 // Android는 YUV(NV21)이 ML Kit 처리 효율에 좋음
-          : ImageFormatGroup.bgra8888, // iOS는 BGRA8888이 일반적
+          ? ImageFormatGroup.nv21 
+          : ImageFormatGroup.bgra8888, 
     );
 
     try {
       await _cameraController!.initialize();
       print("Camera initialized. Preview size: ${_cameraController!.value.previewSize}, Aspect Ratio: ${_cameraController!.value.aspectRatio}");
-
-      // 중요: 실제 이미지 스트림의 해상도는 previewSize와 다를 수 있음.
-      // _lastImageSize는 _processCameraImage 또는 _handleRotationResult에서 CameraImage.width/height로 설정하는 것이 더 정확함.
-
-      await _startCameraStream(); // 이미지 스트림 시작
+      
+      await _startCameraStream(); 
 
       if (mounted) {
         setState(() {
           _isCameraInitialized = true;
           _cameraIndex = widget.cameras.indexOf(cameraDescription);
-          // _lastImageSize를 여기서 설정하면 CameraPreview의 크기일 수 있어 ML Kit 처리 이미지 크기와 다를 수 있음
-          // 정확한 imageSize는 CameraImage 객체에서 가져오는 것이 좋음
         });
       }
     } on CameraException catch (e) {
@@ -336,16 +342,14 @@ class _RealtimeObjectDetectionScreenState
       return;
     }
     try {
-      // 이전 스트림 리스너가 남아있을 수 있으므로, 중지 후 시작 또는 플래그 관리 필요
-      // 여기서는 initializeCamera에서 이전 컨트롤러를 dispose하므로 새 컨트롤러에는 리스너 없음
-      await _cameraController!.startImageStream(_processCameraImage); // 프레임 처리 함수 연결
+      await _cameraController!.startImageStream(_processCameraImage); 
       print("Camera image stream started.");
     } catch (e, stacktrace) {
       print('****** Exception on startCameraStream: $e');
       print(stacktrace);
        if (mounted) {
          ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('카메라 스트림 시작 오류.')),
+          const SnackBar(content: Text('카메라 스트림 시작 오류.')),
         );
       }
     }
@@ -353,7 +357,6 @@ class _RealtimeObjectDetectionScreenState
 
   Future<void> _stopCameraStream() async {
     if (_cameraController == null || !_cameraController!.value.isInitialized || !_cameraController!.value.isStreamingImages) {
-      // print("Cannot stop stream: Camera not initialized or not streaming.");
       return;
     }
     try {
@@ -362,8 +365,8 @@ class _RealtimeObjectDetectionScreenState
     } catch (e, stacktrace) {
       print('****** Exception on stopCameraStream: $e');
       print(stacktrace);
-    } finally { // 스트림 중지 시 관련 상태 초기화
-      if(mounted) { // mounted 체크 추가
+    } finally { 
+      if(mounted) { 
         _isBusy = false;
         _isWaitingForRotation = false;
         _isWaitingForDetection = false;
@@ -374,75 +377,57 @@ class _RealtimeObjectDetectionScreenState
 
   void _processCameraImage(CameraImage image) {
     if (!mounted || _isBusy || _imageRotationIsolateSendPort == null) {
-      // if (_isBusy) print("_processCameraImage: Busy, skipping frame.");
-      // if (_imageRotationIsolateSendPort == null) print("_processCameraImage: Rotation Isolate SendPort is null, skipping frame.");
       return;
     }
-    _isBusy = true;
+    _isBusy = true; 
     _isWaitingForRotation = true;
-    // _isWaitingForDetection = false; // Will be set to true after rotation is known and data sent to detection isolate
 
     try {
-      // print("Processing camera image: ${image.width}x${image.height}, format: ${image.format.group}");
       final WriteBuffer allBytes = WriteBuffer();
-      // NV21의 경우 Y 평면 다음에 UV 평면이 옴. UV는 interleaved.
-      // BGRA의 경우 단일 평면.
       for (final Plane plane in image.planes) {
         allBytes.putUint8List(plane.bytes);
       }
       _pendingImageDataBytes = allBytes.done().buffer.asUint8List();
       _pendingImageDataWidth = image.width;
       _pendingImageDataHeight = image.height;
-      _pendingImageDataFormatRaw = image.format.raw;
+      _pendingImageDataFormatRaw = image.format.raw; 
       _pendingImageDataBytesPerRow = image.planes.isNotEmpty ? image.planes[0].bytesPerRow : 0;
 
       final camera = widget.cameras[_cameraIndex];
-      final orientation = MediaQuery.of(context).orientation; // build context 종속적이므로 주의
+      final orientation = MediaQuery.of(context).orientation; 
       final DeviceOrientation deviceRotation = (orientation == Orientation.landscape)
-          ? (Platform.isIOS ? DeviceOrientation.landscapeRight : DeviceOrientation.landscapeLeft) // iOS는 landscapeRight가 일반적인 홈버튼 오른쪽 기준
+          ? (Platform.isIOS ? DeviceOrientation.landscapeRight : DeviceOrientation.landscapeLeft) 
           : DeviceOrientation.portraitUp;
 
       final Map<String, dynamic> rotationPayload = {
         'sensorOrientation': camera.sensorOrientation,
-        'deviceOrientationIndex': deviceRotation.index, // enum의 index로 전달
-        // 'lensDirection': camera.lensDirection.index // 필요시 전달
+        'deviceOrientationIndex': deviceRotation.index, 
       };
-      _imageRotationIsolateSendPort!.send(rotationPayload); // 회전 계산 요청
+      _imageRotationIsolateSendPort!.send(rotationPayload); 
     } catch (e, stacktrace) {
       print("****** Error preparing image for rotation isolate: $e");
       print(stacktrace);
-      _pendingImageDataBytes = null; // 오류 시 정리
+      _pendingImageDataBytes = null; 
       _isWaitingForRotation = false;
-      _isBusy = false; // 오류 발생 시 _isBusy 해제
+      _isBusy = false; 
     }
   }
 
   void _switchCamera() {
-    if (widget.cameras.length < 2 || _isBusy) return; // 이미 처리 중이면 전환 안 함
+    if (widget.cameras.length < 2 || _isBusy) return; 
     print("Switching camera...");
     final newIndex = (_cameraIndex + 1) % widget.cameras.length;
-    // 기존 스트림 및 컨트롤러 정리 후 새 카메라 초기화
     _stopCameraStream().then((_) {
-      // _cameraController?.dispose(); // _initializeCamera 내부에서 처리
       _initializeCamera(widget.cameras[newIndex]);
     });
   }
 
-  // --- UI 빌드 ---
   @override
   Widget build(BuildContext context) {
-    // print("CameraScreen build called. isCameraInitialized: $_isCameraInitialized, detectedObjects: ${_detectedObjects.length}");
     Widget cameraPreviewWidget;
-    Size? previewSizeOnScreen;
 
     if (_isCameraInitialized && _cameraController != null && _cameraController!.value.isInitialized) {
-      // CameraPreview를 화면에 맞추기 위한 로직이 중요 (AspectRatio + FittedBox or LayoutBuilder)
-      // 현재는 AspectRatio만 사용 중. 이것이 CustomPaint의 크기와 어떻게 연관되는지 중요.
       cameraPreviewWidget = CameraPreview(_cameraController!);
-
-      // LayoutBuilder를 사용하여 CameraPreview가 실제로 차지하는 화면상의 크기를 얻을 수 있음
-      // 하지만 ObjectPainter는 Stack의 자식으로 LayoutBuilder를 이미 사용하고 있으므로,
-      // 그 크기(constraints.biggest)를 screenSize로 활용할 수 있음.
     } else {
       cameraPreviewWidget = Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -465,35 +450,33 @@ class _RealtimeObjectDetectionScreenState
                     ? Icons.camera_front
                     : Icons.camera_rear,
               ),
-              onPressed: _isBusy ? null : _switchCamera, // 바쁠 때는 비활성화
+              onPressed: _isBusy ? null : _switchCamera, 
             ),
         ],
       ),
-      body: SafeArea( // SafeArea 추가하여 노치 등 시스템 UI 피하기
+      body: SafeArea( 
         child: Stack(
           fit: StackFit.expand,
           children: [
             if (_isCameraInitialized && _cameraController != null && _cameraController!.value.isInitialized)
-              Center( // 카메라 프리뷰를 중앙에 배치하고, 크기 조절은 AspectRatio에 맡김
+              Center( 
                 child: AspectRatio(
                   aspectRatio: _cameraController!.value.aspectRatio,
                   child: cameraPreviewWidget,
                 ),
               )
             else
-              Center(child: cameraPreviewWidget), // 초기화 중/실패 시 메시지 표시
+              Center(child: cameraPreviewWidget), 
 
-            // 결과 그리기
             if (_isCameraInitialized && _detectedObjects.isNotEmpty && _lastImageSize != null && _imageRotation != null)
               LayoutBuilder(
                 builder: (context, constraints) {
-                  // print("Painter LayoutBuilder: size=${constraints.biggest}, imageSize=$_lastImageSize, rotation=$_imageRotation");
                   return CustomPaint(
-                    size: constraints.biggest, // LayoutBuilder로부터 실제 그릴 영역의 크기 확보
+                    size: constraints.biggest, 
                     painter: ObjectPainter(
                       objects: _detectedObjects,
-                      imageSize: _lastImageSize!, // ML Kit이 처리한 이미지 크기
-                      screenSize: constraints.biggest, // CustomPaint가 그려질 위젯의 크기
+                      imageSize: _lastImageSize!, 
+                      screenSize: constraints.biggest, 
                       rotation: _imageRotation!,
                       cameraLensDirection: widget.cameras[_cameraIndex].lensDirection,
                     ),
@@ -501,20 +484,21 @@ class _RealtimeObjectDetectionScreenState
                 }
               ),
 
-            if (_isBusy && _isCameraInitialized) // 로딩 표시는 카메라 초기화 후, 작업 중일 때만
-              Container(
-                color: Colors.black.withOpacity(0.5),
-                child: const Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      CircularProgressIndicator(color: Colors.white),
-                      SizedBox(height: 8),
-                      Text("처리 중...", style: TextStyle(color: Colors.white, fontSize: 16)),
-                    ],
-                  )
-                ),
-              ),
+            // "처리 중..." 오버레이 표시 로직 제거
+            // if (_isBusy && _isCameraInitialized) 
+            //   Container(
+            //     color: Colors.black.withOpacity(0.5),
+            //     child: const Center(
+            //       child: Column(
+            //         mainAxisSize: MainAxisSize.min,
+            //         children: [
+            //           CircularProgressIndicator(color: Colors.white),
+            //           SizedBox(height: 8),
+            //           Text("처리 중...", style: TextStyle(color: Colors.white, fontSize: 16)),
+            //         ],
+            //       )
+            //     ),
+            //   ),
           ],
         ),
       ),
